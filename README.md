@@ -1,3 +1,25 @@
+# Wrist-EMG typing under electrode shifts
+
+How much does changing wristband placement affect a typing decoder? We replayed the same wrist muscle recordings with the electrode indices shifted on one wrist. The target keystrokes stayed fixed. Four convolutional models isolate the effects of random channel shifts during training and local feature averaging. A fifth model replaces the temporal convolution with a recurrent encoder.
+
+| ID | Temporal encoder | Training-time shift | Position averaging | Clean test CER | Mean shifted test CER |
+| --- | --- | --- | --- | ---: | ---: |
+| E1 | TDS convolution | On | On | 22.89% | **27.47%** |
+| E2 | GRU | On | On | 85.56% | 86.52% |
+| E3 | TDS convolution | Off | On | **22.76%** | 37.54% |
+| E4 | TDS convolution | On | Off | 23.86% | 28.60% |
+| E5 | TDS convolution | Off | Off | 22.87% | 40.50% |
+
+E1 and E5 made 1,059 and 1,058 character errors on the original 4,627-character recording. Across eight simulated placements, enabling both mechanisms reduced mean character error rate (CER) by **13.03 percentage points**. The training-time shift accounted for most of that reduction in both comparisons where the averaging setting was held fixed. This study used one participant, one held-out test session, and one training seed. Physical changes in skin contact were outside the experiment.
+
+![Character error rate for all five models at electrode offsets from minus two to plus two on the left and right wrists](results/test/shifts.png)
+
+To repeat the experiment on a CUDA GPU, follow the environment, data audit, training and checkpoint-freeze steps. The tables include all five models and all 45 test conditions. [Reproduction guide](REPRODUCE.md) · [Model results](results/test/model_summary.csv) · [Errors by model and shift](results/test/condition_counts.csv)
+
+The signals, CTC baseline decoder and original shift mechanisms come from the emg2qwerty benchmark. This fork adds the GRU comparison, four-condition convolutional ablation, paired shift evaluator and results. The original documentation follows below. [Course starter](https://github.com/Calvin-Pang/emg2qwerty) · [Original project](https://github.com/facebookresearch/emg2qwerty) · [CC BY-NC-SA 4.0 license](LICENSE)
+
+---
+
 # C147/247 Final Project
 ### Fall 2026 
 
@@ -129,7 +151,7 @@ The 6-gram character-level language model, used by the first-pass beam-search de
 
 ## License
 
-emg2qwerty is CC-BY-NC-4.0 licensed, as found in the LICENSE file.
+The repository license is Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International. [License text](LICENSE)
 
 ## Citing emg2qwerty
 

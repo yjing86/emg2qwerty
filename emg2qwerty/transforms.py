@@ -120,6 +120,31 @@ class RandomBandRotation:
         return tensor.roll(offset, dims=self.channel_dim)
 
 
+@dataclass(frozen=True)
+class FixedWristShift:
+    """Cyclically shift the electrode channels of each wrist in a raw sample.
+
+    A positive offset moves channel 15 into position 0 for an offset of one.
+    Input axes are time, wrist (left then right), and electrode. One offset
+    applies to the entire recording, including all of its evaluation windows.
+    """
+
+    left: int = 0
+    right: int = 0
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.ndim != 3 or tensor.shape[1:] != (2, 16):
+            raise ValueError(
+                "Expected raw EMG of shape (time, 2 wrists, 16 electrodes)"
+            )
+        if self.left == self.right == 0:
+            return tensor
+        left, right = tensor.unbind(dim=1)
+        return torch.stack(
+            (left.roll(self.left, -1), right.roll(self.right, -1)), dim=1
+        )
+
+
 @dataclass
 class TemporalAlignmentJitter:
     """Applies a temporal jittering augmentation that randomly jitters the
@@ -170,8 +195,11 @@ class LogSpectrogram:
 
     n_fft: int = 64
     hop_length: int = 16
+    chunk_frames: int | None = None
 
     def __post_init__(self) -> None:
+        if self.chunk_frames is not None and self.chunk_frames < 1:
+            raise ValueError("chunk_frames must be positive")
         self.spectrogram = torchaudio.transforms.Spectrogram(
             n_fft=self.n_fft,
             hop_length=self.hop_length,
@@ -183,6 +211,22 @@ class LogSpectrogram:
         )
 
     def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.chunk_frames is not None and len(tensor) >= self.n_fft:
+            frames = 1 + (len(tensor) - self.n_fft) // self.hop_length
+            if frames > self.chunk_frames:
+                pieces = []
+                for start in range(0, frames, self.chunk_frames):
+                    stop = min(start + self.chunk_frames, frames)
+                    # With center=False each output spans one complete FFT window.
+                    raw = tensor[
+                        start * self.hop_length : (stop - 1) * self.hop_length
+                        + self.n_fft
+                    ]
+                    pieces.append(self._log_spectrogram(raw))
+                return torch.cat(pieces, dim=0)
+        return self._log_spectrogram(tensor)
+
+    def _log_spectrogram(self, tensor: torch.Tensor) -> torch.Tensor:
         x = tensor.movedim(0, -1)  # (T, ..., C) -> (..., C, T)
         spec = self.spectrogram(x)  # (..., C, freq, T)
         logspec = torch.log10(spec + 1e-6)  # (..., C, freq, T)

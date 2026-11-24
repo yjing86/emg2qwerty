@@ -1,0 +1,12 @@
+# @package _global_
+defaults:
+  - log_spectrogram
+  - _self_
+
+# Identical timing jitter, spectrogram and masking to the course baseline.
+transforms:
+  train:
+    - ${to_tensor}
+    - ${temporal_jitter}
+    - ${logspec}
+    - ${specaug}

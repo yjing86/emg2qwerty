@@ -53,3 +53,8 @@ bids_data
 
 # LM
 wikitext-103-raw*
+
+# Local study artifacts (including per-recording transcripts)
+/runs/
+/results/reproduced/
+*.hdf5

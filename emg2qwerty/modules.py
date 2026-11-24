@@ -263,6 +263,7 @@ class TDSConvEncoder(nn.Module):
         super().__init__()
 
         assert len(block_channels) > 0
+        self.left_context = len(block_channels) * (kernel_width - 1)
         tds_conv_blocks: list[nn.Module] = []
         for channels in block_channels:
             assert (
@@ -278,3 +279,28 @@ class TDSConvEncoder(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         return self.tds_conv_blocks(inputs)  # (T, N, num_features)
+
+
+class CausalGRUEncoder(nn.Module):
+    """Warm the hidden state on the initial context before emitting CTC frames.
+
+    The course valid-convolution TDS aligns its first emission to the right
+    endpoint of its receptive field. Using the same first endpoint for the GRU
+    gives paired windows identical emission times. Later outputs depend only on
+    earlier inputs, so trailing batch padding cannot affect valid outputs.
+    """
+
+    def __init__(
+        self, in_features: int, hidden_size: int, num_layers: int, warmup_frames: int
+    ) -> None:
+        super().__init__()
+        if warmup_frames < 0:
+            raise ValueError("warmup_frames must be nonnegative.")
+        self.left_context = warmup_frames
+        self.gru = nn.GRU(in_features, hidden_size, num_layers=num_layers)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        if len(inputs) <= self.left_context:
+            raise ValueError("At least one emission frame must follow the GRU warm-up.")
+        sequence, _ = self.gru(inputs)
+        return sequence[self.left_context :]

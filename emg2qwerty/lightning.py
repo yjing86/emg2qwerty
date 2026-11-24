@@ -22,6 +22,7 @@ from emg2qwerty.charset import charset
 from emg2qwerty.data import LabelData, WindowedEMGDataset
 from emg2qwerty.metrics import CharacterErrorRates
 from emg2qwerty.modules import (
+    CausalGRUEncoder,
     MultiBandRotationInvariantMLP,
     SpectrogramNorm,
     TDSConvEncoder,
@@ -60,44 +61,47 @@ class WindowedEMGDataModule(pl.LightningDataModule):
         self.test_transform = test_transform
 
     def setup(self, stage: str | None = None) -> None:
-        self.train_dataset = ConcatDataset(
-            [
-                WindowedEMGDataset(
-                    hdf5_path,
-                    transform=self.train_transform,
-                    window_length=self.window_length,
-                    padding=self.padding,
-                    jitter=True,
-                )
-                for hdf5_path in self.train_sessions
-            ]
-        )
-        self.val_dataset = ConcatDataset(
-            [
-                WindowedEMGDataset(
-                    hdf5_path,
-                    transform=self.val_transform,
-                    window_length=self.window_length,
-                    padding=self.padding,
-                    jitter=False,
-                )
-                for hdf5_path in self.val_sessions
-            ]
-        )
-        self.test_dataset = ConcatDataset(
-            [
-                WindowedEMGDataset(
-                    hdf5_path,
-                    transform=self.test_transform,
-                    # Feed the entire session at once without windowing/padding
-                    # at test time for more realism
-                    window_length=None,
-                    padding=(0, 0),
-                    jitter=False,
-                )
-                for hdf5_path in self.test_sessions
-            ]
-        )
+        if stage in (None, "fit"):
+            self.train_dataset = ConcatDataset(
+                [
+                    WindowedEMGDataset(
+                        hdf5_path,
+                        transform=self.train_transform,
+                        window_length=self.window_length,
+                        padding=self.padding,
+                        jitter=True,
+                    )
+                    for hdf5_path in self.train_sessions
+                ]
+            )
+        if stage in (None, "fit", "validate"):
+            self.val_dataset = ConcatDataset(
+                [
+                    WindowedEMGDataset(
+                        hdf5_path,
+                        transform=self.val_transform,
+                        window_length=self.window_length,
+                        padding=self.padding,
+                        jitter=False,
+                    )
+                    for hdf5_path in self.val_sessions
+                ]
+            )
+        if stage in (None, "test"):
+            self.test_dataset = ConcatDataset(
+                [
+                    WindowedEMGDataset(
+                        hdf5_path,
+                        transform=self.test_transform,
+                        # Feed the entire session at once without windowing/padding
+                        # at test time for more realism
+                        window_length=None,
+                        padding=(0, 0),
+                        jitter=False,
+                    )
+                    for hdf5_path in self.test_sessions
+                ]
+            )
 
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
@@ -107,7 +111,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -118,7 +122,7 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -133,52 +137,32 @@ class WindowedEMGDataModule(pl.LightningDataModule):
             num_workers=self.num_workers,
             collate_fn=WindowedEMGDataset.collate,
             pin_memory=True,
-            persistent_workers=True,
+            persistent_workers=self.num_workers > 0,
         )
 
 
-class TDSConvCTCModule(pl.LightningModule):
+class _WristCTCModule(pl.LightningModule):
     NUM_BANDS: ClassVar[int] = 2
     ELECTRODE_CHANNELS: ClassVar[int] = 16
 
-    def __init__(
+    def _frontend(
         self,
         in_features: int,
         mlp_features: Sequence[int],
-        block_channels: Sequence[int],
-        kernel_width: int,
-        optimizer: DictConfig,
-        lr_scheduler: DictConfig,
-        decoder: DictConfig,
-    ) -> None:
-        super().__init__()
-        self.save_hyperparameters()
-
-        num_features = self.NUM_BANDS * mlp_features[-1]
-
-        # Model
-        # inputs: (T, N, bands=2, electrode_channels=16, freq)
-        self.model = nn.Sequential(
-            # (T, N, bands=2, C=16, freq)
+        mlp_offsets: Sequence[int],
+    ) -> list[nn.Module]:
+        return [
             SpectrogramNorm(channels=self.NUM_BANDS * self.ELECTRODE_CHANNELS),
-            # (T, N, bands=2, mlp_features[-1])
             MultiBandRotationInvariantMLP(
                 in_features=in_features,
                 mlp_features=mlp_features,
+                offsets=mlp_offsets,
                 num_bands=self.NUM_BANDS,
             ),
-            # (T, N, num_features)
             nn.Flatten(start_dim=2),
-            TDSConvEncoder(
-                num_features=num_features,
-                block_channels=block_channels,
-                kernel_width=kernel_width,
-            ),
-            # (T, N, num_classes)
-            nn.Linear(num_features, charset().num_classes),
-            nn.LogSoftmax(dim=-1),
-        )
+        ]
 
+    def _setup_ctc(self, decoder: DictConfig) -> None:
         # Criterion
         self.ctc_loss = nn.CTCLoss(blank=charset().null_class)
 
@@ -208,10 +192,8 @@ class TDSConvCTCModule(pl.LightningModule):
 
         emissions = self.forward(inputs)
 
-        # Shrink input lengths by an amount equivalent to the conv encoder's
-        # temporal receptive field to compute output activation lengths for CTCLoss.
-        # NOTE: This assumes the encoder doesn't perform any temporal downsampling
-        # such as by striding.
+        # Both encoders preserve frame stride after their initial context.
+        # Subtract the measured reduction from each unpadded sequence length.
         T_diff = inputs.shape[0] - emissions.shape[0]
         emission_lengths = input_lengths - T_diff
 
@@ -269,3 +251,97 @@ class TDSConvCTCModule(pl.LightningModule):
             optimizer_config=self.hparams.optimizer,
             lr_scheduler_config=self.hparams.lr_scheduler,
         )
+
+
+class TDSConvCTCModule(_WristCTCModule):
+    """Course TDS baseline, optionally using only the unshifted wrist MLP."""
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        block_channels: Sequence[int],
+        kernel_width: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        mlp_offsets: Sequence[int] = (-1, 0, 1),
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+        num_features = self.NUM_BANDS * mlp_features[-1]
+        # Preserve the course checkpoint keys (model.0 through model.5).
+        self.model = nn.Sequential(
+            *self._frontend(in_features, mlp_features, mlp_offsets),
+            TDSConvEncoder(num_features, block_channels, kernel_width),
+            nn.Linear(num_features, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+        self._setup_ctc(decoder)
+
+    @torch.inference_mode()
+    def forward_in_chunks(self, inputs: torch.Tensor, chunk_frames: int) -> torch.Tensor:
+        """Evaluate on contiguous output chunks with exact convolutional overlap."""
+        if self.training or chunk_frames < 1:
+            raise ValueError("Chunked evaluation requires eval mode and positive chunk_frames.")
+        context = self.model[3].left_context
+        num_outputs = len(inputs) - context
+        if num_outputs <= 0:
+            raise ValueError("The input is shorter than the TDS receptive field.")
+        emissions = []
+        for start in range(0, num_outputs, chunk_frames):
+            segment = inputs[start : start + chunk_frames + context].to(self.device)
+            emissions.append(self(segment))
+        return torch.cat(emissions)
+
+
+class GRUCTCModule(_WristCTCModule):
+    """Unidirectional GRU with the course wrist frontend and CTC decoder."""
+
+    def __init__(
+        self,
+        in_features: int,
+        mlp_features: Sequence[int],
+        hidden_size: int,
+        num_layers: int,
+        emission_warmup_frames: int,
+        optimizer: DictConfig,
+        lr_scheduler: DictConfig,
+        decoder: DictConfig,
+        mlp_offsets: Sequence[int] = (-1, 0, 1),
+    ) -> None:
+        super().__init__()
+        self.save_hyperparameters()
+        self.model = nn.Sequential(
+            *self._frontend(in_features, mlp_features, mlp_offsets),
+            CausalGRUEncoder(
+                self.NUM_BANDS * mlp_features[-1],
+                hidden_size,
+                num_layers,
+                emission_warmup_frames,
+            ),
+            nn.Linear(hidden_size, charset().num_classes),
+            nn.LogSoftmax(dim=-1),
+        )
+        self._setup_ctc(decoder)
+
+    @torch.inference_mode()
+    def forward_in_chunks(self, inputs: torch.Tensor, chunk_frames: int) -> torch.Tensor:
+        """Carry the recurrent state across chunks; warm up once per sequence."""
+        if self.training or chunk_frames < 1:
+            raise ValueError("Chunked evaluation requires eval mode and positive chunk_frames.")
+        frontend = self.model[:3]
+        encoder = self.model[3]
+        readout = self.model[4:]
+        if len(inputs) <= encoder.left_context:
+            raise ValueError("The input is shorter than the GRU emission warm-up.")
+        state = None
+        emissions = []
+        for start in range(0, len(inputs), chunk_frames):
+            segment = inputs[start : start + chunk_frames].to(self.device)
+            features = frontend(segment)
+            sequence, state = encoder.gru(features, state)
+            first = max(encoder.left_context - start, 0)
+            if first < len(sequence):
+                emissions.append(readout(sequence[first:]))
+        return torch.cat(emissions)
